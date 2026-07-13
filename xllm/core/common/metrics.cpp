@@ -96,6 +96,15 @@ DEFINE_GAUGE(num_online_prefill_preempt_offline_requests,
              "Number of online prefill preempt offline requests in scheduler");
 DEFINE_GAUGE(num_online_decode_preempt_offline_requests,
              "Number of online decode preempt offline requests in scheduler");
+DEFINE_GAUGE(num_short_request_first_immediate_waiting,
+             "Number of immediate requests waiting in PD-prefill "
+             "ShortRequestFirst");
+DEFINE_GAUGE(num_short_request_first_short_waiting,
+             "Number of short requests waiting in PD-prefill "
+             "ShortRequestFirst");
+DEFINE_GAUGE(num_short_request_first_long_waiting,
+             "Number of long requests waiting in PD-prefill "
+             "ShortRequestFirst");
 
 DEFINE_GAUGE(num_running_sequences, "Number of running sequences");
 
@@ -107,6 +116,9 @@ DEFINE_GAUGE(num_free_blocks, "Number of free blocks in the block allocator");
 DEFINE_GAUGE(num_used_blocks, "Effective number of blocks in use");
 
 DEFINE_COUNTER(scheduling_latency_seconds, "Latency of scheduling in seconds");
+DEFINE_COUNTER(short_request_first_aged_long_promotions_total,
+               "Total number of aged long requests promoted ahead of short "
+               "requests in PD-prefill ShortRequestFirst");
 
 DEFINE_COUNTER(num_processing_tokens_total_prompt,
                "Total number of processing prompt tokens");

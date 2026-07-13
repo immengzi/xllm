@@ -23,6 +23,7 @@ limitations under the License.
 #include "framework/request/request.h"
 #include "framework/request/sequence.h"
 #include "scheduler/disagg_pd_scheduler.h"
+#include "scheduler/pd_prefill_short_request_first_queue.h"
 
 namespace xllm {
 
@@ -67,13 +68,21 @@ bool pd_prefill_footprint_fits(size_t reserved_blocks,
 
 class DisaggPDChunkedPrefillScheduler final : public DisaggPDScheduler {
  public:
-  DisaggPDChunkedPrefillScheduler(Engine* engine, const Options& options);
+  DisaggPDChunkedPrefillScheduler(
+      Engine* engine,
+      const Options& options,
+      PdPrefillShortRequestFirstQueue::NowMsFn now_ms = nullptr);
   ~DisaggPDChunkedPrefillScheduler() override = default;
+
+  uint32_t get_waiting_requests_num() const override;
+
+  std::vector<std::shared_ptr<Request>> get_waiting_requests();
 
  protected:
   std::vector<Batch> prepare_batch() override;
 
  private:
+  void validate_short_request_first_options() const;
   bool alloc_chunk(Sequence* sequence,
                    size_t token_budget,
                    size_t* actual_tokens);
@@ -84,7 +93,16 @@ class DisaggPDChunkedPrefillScheduler final : public DisaggPDScheduler {
                                 size_t total_blocks,
                                 size_t& reserved_blocks,
                                 std::vector<std::shared_ptr<Request>>& done);
+  void schedule_waiting_prefill(PdPrefillShortRequestFirstQueue& queue,
+                                size_t& remaining_token_budget,
+                                size_t& remaining_seq_budget,
+                                size_t total_blocks,
+                                size_t& reserved_blocks,
+                                std::vector<std::shared_ptr<Request>>& done);
+  void migrate_online_waiting_queue();
   void update_metrics();
+
+  std::unique_ptr<PdPrefillShortRequestFirstQueue> short_request_first_queue_;
 };
 
 }  // namespace xllm

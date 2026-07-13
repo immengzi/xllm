@@ -153,12 +153,16 @@ DECLARE_GAUGE(num_offline_decode_preempt_offline_requests);
 DECLARE_GAUGE(num_online_decode_preempt_online_requests);
 DECLARE_GAUGE(num_online_prefill_preempt_offline_requests);
 DECLARE_GAUGE(num_online_decode_preempt_offline_requests);
+DECLARE_GAUGE(num_short_request_first_immediate_waiting);
+DECLARE_GAUGE(num_short_request_first_short_waiting);
+DECLARE_GAUGE(num_short_request_first_long_waiting);
 DECLARE_GAUGE(num_running_sequences);
 DECLARE_GAUGE(kv_cache_utilization_perc);
 DECLARE_GAUGE(num_blocks_in_prefix_cache);
 DECLARE_GAUGE(num_free_blocks);
 DECLARE_GAUGE(num_used_blocks);
 DECLARE_COUNTER(scheduling_latency_seconds);
+DECLARE_COUNTER(short_request_first_aged_long_promotions_total);
 
 // total number of processing tokens
 DECLARE_COUNTER(num_processing_tokens_total_prompt);

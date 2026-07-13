@@ -21,6 +21,7 @@ limitations under the License.
 #include "common/metrics.h"
 #include "core/framework/config/scheduler_config.h"
 #include "framework/batch/batch_factory.h"
+#include "glog/logging.h"
 #include "util/utils.h"
 
 namespace xllm {
@@ -100,8 +101,68 @@ bool pd_prefill_footprint_fits(size_t reserved_blocks,
 
 DisaggPDChunkedPrefillScheduler::DisaggPDChunkedPrefillScheduler(
     Engine* engine,
-    const Options& options)
-    : DisaggPDScheduler(engine, options) {}
+    const Options& options,
+    PdPrefillShortRequestFirstQueue::NowMsFn now_ms)
+    : DisaggPDScheduler(engine, options) {
+  const SchedulerConfig& scheduler_config = SchedulerConfig::get_instance();
+  if (scheduler_config.enable_short_request_first()) {
+    validate_short_request_first_options();
+    short_request_first_queue_ =
+        std::make_unique<PdPrefillShortRequestFirstQueue>(
+            scheduler_config.short_request_first_threshold(),
+            scheduler_config.short_request_first_long_max_wait_ms(),
+            now_ms);
+    LOG(INFO) << "Enable PD-prefill ShortRequestFirst scheduling: threshold="
+              << scheduler_config.short_request_first_threshold()
+              << ", long_max_wait_ms="
+              << scheduler_config.short_request_first_long_max_wait_ms();
+  }
+}
+
+uint32_t DisaggPDChunkedPrefillScheduler::get_waiting_requests_num() const {
+  uint32_t online_waiting = waiting_priority_queue_->size();
+  if (short_request_first_queue_ != nullptr) {
+    online_waiting = static_cast<uint32_t>(short_request_first_queue_->size()) +
+                     static_cast<uint32_t>(waiting_priority_queue_->size());
+  }
+  return online_waiting +
+         static_cast<uint32_t>(waiting_priority_queue_offline_->size());
+}
+
+std::vector<std::shared_ptr<Request>>
+DisaggPDChunkedPrefillScheduler::get_waiting_requests() {
+  std::vector<std::shared_ptr<Request>> result;
+  if (short_request_first_queue_ != nullptr) {
+    result = short_request_first_queue_->snapshot();
+    if (waiting_priority_queue_ != nullptr) {
+      auto copied_waiting_queue = waiting_priority_queue_->clone();
+      while (!copied_waiting_queue->empty()) {
+        result.emplace_back(copied_waiting_queue->top());
+        copied_waiting_queue->pop_top();
+      }
+    }
+    return result;
+  }
+  return ContinuousScheduler::get_waiting_requests();
+}
+
+void DisaggPDChunkedPrefillScheduler::validate_short_request_first_options()
+    const {
+  if (!options_.enable_disagg_pd()) {
+    LOG(FATAL) << "ShortRequestFirst requires enable_disagg_pd=true.";
+  }
+  if (!options_.enable_chunked_prefill()) {
+    LOG(FATAL) << "ShortRequestFirst requires enable_chunked_prefill=true.";
+  }
+  if (options_.instance_role() == InstanceRole::DECODE) {
+    LOG(FATAL) << "ShortRequestFirst is only supported on PD prefill or mix "
+               << "instances, not decode instances.";
+  }
+  if (options_.priority_strategy() != "fcfs") {
+    LOG(FATAL) << "ShortRequestFirst requires priority_strategy=fcfs, got "
+               << options_.priority_strategy();
+  }
+}
 
 void DisaggPDChunkedPrefillScheduler::match_prefix_blocks(Sequence* sequence) {
   CHECK(sequence != nullptr);
@@ -274,13 +335,122 @@ void DisaggPDChunkedPrefillScheduler::schedule_waiting_prefill(
   }
 }
 
+void DisaggPDChunkedPrefillScheduler::schedule_waiting_prefill(
+    PdPrefillShortRequestFirstQueue& queue,
+    size_t& remaining_token_budget,
+    size_t& remaining_seq_budget,
+    size_t total_blocks,
+    size_t& reserved_blocks,
+    std::vector<std::shared_ptr<Request>>& done) {
+  const size_t block_size =
+      static_cast<size_t>(kv_cache_manager_->block_size());
+  std::vector<std::shared_ptr<Request>> deferred;
+
+  while (!queue.empty() && remaining_token_budget > 0 &&
+         remaining_seq_budget > 0) {
+    ShortRequestFirstDispatch dispatch = ShortRequestFirstDispatch::LONG;
+    std::shared_ptr<Request> request = queue.pop_next(&dispatch);
+    if (request->finished() || request->cancelled()) {
+      kv_cache_manager_->deallocate(request.get());
+      queue.erase_request_tracking(request);
+      done.emplace_back(request);
+      continue;
+    }
+
+    CHECK(!request->sequences().empty());
+    if (!kv_cache_manager_->update_prefetch_result(
+            request, options_.prefetch_timeout())) {
+      deferred.emplace_back(request);
+      continue;
+    }
+
+    Sequence* sequence = request->sequences()[0].get();
+    const size_t held_blocks = sequence->kv_state().num_blocks(BlockType::KV);
+    const bool is_in_flight = held_blocks > 0;
+    const bool is_sole_fresh_request =
+        running_sequences_.empty() && deferred.empty() &&
+        queue.size() + waiting_priority_queue_offline_->size() == 0;
+    const size_t full_blocks = pd_prefill_remaining_blocks(
+        sequence->num_prompt_tokens(), /*held_blocks=*/0, block_size);
+    if (!is_in_flight && !is_sole_fresh_request &&
+        !pd_prefill_footprint_fits(
+            reserved_blocks, full_blocks, total_blocks)) {
+      deferred.emplace_back(request);
+      continue;
+    }
+
+    size_t actual_tokens = 0;
+    if (!alloc_chunk(sequence, remaining_token_budget, &actual_tokens)) {
+      if (running_sequences_.empty() &&
+          exceeds_block_capacity(sequence, kv_cache_manager_)) {
+        queue.erase_request_tracking(request);
+        kv_cache_manager_->deallocate(request.get());
+        LOG(ERROR) << "Request prompt is too long, no enough resource to "
+                      "schedule a single pd chunked prefill sequence.";
+        response_processor_->process_failed_request(
+            request,
+            {StatusCode::RESOURCE_EXHAUSTED,
+             "No enough resource to schedule a single pd chunked prefill "
+             "sequence"});
+        continue;
+      }
+      deferred.emplace_back(request);
+      break;
+    }
+
+    queue.erase_request_tracking(request);
+    running_requests_.emplace_back(request);
+    running_sequences_.emplace_back(sequence);
+    running_sequences_budgets_.emplace_back(actual_tokens);
+    remaining_token_budget -= actual_tokens;
+    --remaining_seq_budget;
+    if (!is_in_flight) {
+      reserved_blocks += full_blocks;
+    }
+    if (dispatch == ShortRequestFirstDispatch::AGED_LONG) {
+      COUNTER_INC(short_request_first_aged_long_promotions_total);
+    }
+
+    const size_t kv_tokens = sequence->kv_cache_tokens_num();
+    if (kv_tokens + actual_tokens >= sequence->num_prompt_tokens()) {
+      last_step_prefill_ = true;
+    }
+  }
+
+  queue.requeue_deferred(deferred);
+}
+
+void DisaggPDChunkedPrefillScheduler::migrate_online_waiting_queue() {
+  if (short_request_first_queue_ == nullptr ||
+      waiting_priority_queue_ == nullptr) {
+    return;
+  }
+  while (!waiting_priority_queue_->empty()) {
+    short_request_first_queue_->push(waiting_priority_queue_->top());
+    waiting_priority_queue_->pop_top();
+  }
+}
+
 void DisaggPDChunkedPrefillScheduler::update_metrics() {
   GAUGE_SET(num_pending_requests,
             pending_requests_.load(std::memory_order_relaxed));
   GAUGE_SET(num_running_requests, running_requests_.size());
+  size_t online_waiting = waiting_priority_queue_->size();
+  if (short_request_first_queue_ != nullptr) {
+    online_waiting += short_request_first_queue_->size();
+    GAUGE_SET(num_short_request_first_immediate_waiting,
+              short_request_first_queue_->immediate_size());
+    GAUGE_SET(num_short_request_first_short_waiting,
+              short_request_first_queue_->short_size());
+    GAUGE_SET(num_short_request_first_long_waiting,
+              short_request_first_queue_->long_size());
+  } else {
+    GAUGE_SET(num_short_request_first_immediate_waiting, 0);
+    GAUGE_SET(num_short_request_first_short_waiting, 0);
+    GAUGE_SET(num_short_request_first_long_waiting, 0);
+  }
   GAUGE_SET(num_waiting_requests,
-            waiting_priority_queue_->size() +
-                waiting_priority_queue_offline_->size());
+            online_waiting + waiting_priority_queue_offline_->size());
   GAUGE_SET(num_running_sequences, running_sequences_.size());
   update_block_metrics(kv_cache_manager_);
 }
@@ -290,6 +460,7 @@ std::vector<Batch> DisaggPDChunkedPrefillScheduler::prepare_batch() {
     return ContinuousScheduler::prepare_batch();
   }
   Timer timer;
+  migrate_online_waiting_queue();
 
   std::shared_ptr<Request> request;
   while (request_queue_.read(request)) {
@@ -300,6 +471,8 @@ std::vector<Batch> DisaggPDChunkedPrefillScheduler::prepare_batch() {
     // seq[0]'s prompt KV). Expanding here would waste N x prefill compute.
     if (request->offline()) {
       waiting_priority_queue_offline_->push(request);
+    } else if (short_request_first_queue_ != nullptr) {
+      short_request_first_queue_->push(request);
     } else {
       waiting_priority_queue_->push(request);
     }
@@ -338,6 +511,8 @@ std::vector<Batch> DisaggPDChunkedPrefillScheduler::prepare_batch() {
       }
       if (running->offline()) {
         waiting_priority_queue_offline_->push(running);
+      } else if (short_request_first_queue_ != nullptr) {
+        short_request_first_queue_->push(running);
       } else {
         waiting_priority_queue_->push(running);
       }
@@ -365,12 +540,21 @@ std::vector<Batch> DisaggPDChunkedPrefillScheduler::prepare_batch() {
   // starts cannot each reserve the full capacity independently.
   const size_t total_blocks =
       static_cast<size_t>(kv_cache_manager_->num_blocks());
-  schedule_waiting_prefill(*waiting_priority_queue_,
-                           remaining_token_budget,
-                           remaining_seq_budget,
-                           total_blocks,
-                           reserved_blocks,
-                           done);
+  if (short_request_first_queue_ != nullptr) {
+    schedule_waiting_prefill(*short_request_first_queue_,
+                             remaining_token_budget,
+                             remaining_seq_budget,
+                             total_blocks,
+                             reserved_blocks,
+                             done);
+  } else {
+    schedule_waiting_prefill(*waiting_priority_queue_,
+                             remaining_token_budget,
+                             remaining_seq_budget,
+                             total_blocks,
+                             reserved_blocks,
+                             done);
+  }
   schedule_waiting_prefill(*waiting_priority_queue_offline_,
                            remaining_token_budget,
                            remaining_seq_budget,

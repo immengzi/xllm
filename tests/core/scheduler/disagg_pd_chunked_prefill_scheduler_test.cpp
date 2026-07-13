@@ -25,6 +25,7 @@ limitations under the License.
 
 #include "common/metrics.h"
 #include "core/framework/config/kv_cache_config.h"
+#include "core/framework/config/scheduler_config.h"
 #include "distributed_runtime/engine.h"
 #include "framework/block/block_manager_pool.h"
 #include "framework/request/request.h"
@@ -163,10 +164,13 @@ DisaggPDChunkedPrefillScheduler::Options make_options(
   return options;
 }
 
-std::shared_ptr<Request> make_request(
-    const std::vector<int32_t>& prompt_token_ids) {
+std::shared_ptr<Request> make_request_with_options(
+    const std::string& request_id,
+    const std::vector<int32_t>& prompt_token_ids,
+    bool offline) {
   RequestSamplingParam sampling_param;
   SchedulerParam scheduler_param;
+  scheduler_param.offline = offline;
 
   StoppingChecker stopping_checker;
   stopping_checker.set_max_generated_tokens(4);
@@ -190,7 +194,13 @@ std::shared_ptr<Request> make_request(
                      /*service_request_id=*/nullptr);
 
   return std::make_shared<Request>(
-      "req", "x-request-id", "x-request-time", state, "service-req");
+      request_id, "x-request-id", "x-request-time", state, "service-req");
+}
+
+std::shared_ptr<Request> make_request(
+    const std::vector<int32_t>& prompt_token_ids) {
+  return make_request_with_options(
+      /*request_id=*/"req", prompt_token_ids, /*offline=*/false);
 }
 
 size_t first_cache_size(const BlockManagerPool& block_manager) {
@@ -627,6 +637,263 @@ TEST(DisaggPDChunkedPrefillSchedulerTest, FullPrefixHitStillSchedulesStep) {
 
   block_manager->deallocate(request.get());
   release_prefix_cache(block_manager);
+}
+
+TEST(DisaggPDChunkedPrefillSchedulerTest,
+     FeatureOffKeepsExistingOnlineFcfsOrder) {
+  ScopedConfigValue<bool> prefix_cache(
+      KVCacheConfig::get_instance().enable_prefix_cache(), true);
+  ScopedConfigValue<bool> enable_short_request_first(
+      SchedulerConfig::get_instance().enable_short_request_first(), false);
+  FakeEngine engine(/*num_blocks=*/32, /*block_size=*/2);
+  BlockManagerPool* block_manager = engine.block_manager_pool();
+  DisaggPDChunkedPrefillScheduler scheduler(&engine,
+                                            make_options(
+                                                /*max_tokens_per_batch=*/4,
+                                                /*max_chunk=*/4));
+  std::shared_ptr<Request> long_request =
+      make_request_with_options("long",
+                                {1, 2, 3, 4, 5, 6, 7, 8},
+                                /*offline=*/false);
+  std::shared_ptr<Request> short_request =
+      make_request_with_options("short", {9, 10}, /*offline=*/false);
+  ASSERT_TRUE(scheduler.ContinuousScheduler::add_request(long_request));
+  ASSERT_TRUE(scheduler.ContinuousScheduler::add_request(short_request));
+
+  std::vector<Batch> batches = scheduler.prepare_batch_test();
+
+  ASSERT_EQ(batches.size(), 1u);
+  ASSERT_EQ(scheduler.get_running_requests().size(), 1u);
+  EXPECT_EQ(scheduler.get_running_requests()[0]->request_id(), "long");
+
+  block_manager->deallocate(scheduler.get_running_requests()[0].get());
+}
+
+TEST(DisaggPDChunkedPrefillSchedulerTest,
+     FeatureOnSchedulesShortBeforeLongOnlineRequest) {
+  ScopedConfigValue<bool> prefix_cache(
+      KVCacheConfig::get_instance().enable_prefix_cache(), true);
+  ScopedConfigValue<bool> enable_short_request_first(
+      SchedulerConfig::get_instance().enable_short_request_first(), true);
+  ScopedConfigValue<int32_t> short_request_first_threshold(
+      SchedulerConfig::get_instance().short_request_first_threshold(), 4);
+  ScopedConfigValue<double> short_request_first_long_max_wait_ms(
+      SchedulerConfig::get_instance().short_request_first_long_max_wait_ms(),
+      0.0);
+  FakeEngine engine(/*num_blocks=*/32, /*block_size=*/2);
+  BlockManagerPool* block_manager = engine.block_manager_pool();
+  DisaggPDChunkedPrefillScheduler scheduler(&engine,
+                                            make_options(
+                                                /*max_tokens_per_batch=*/4,
+                                                /*max_chunk=*/4));
+  std::shared_ptr<Request> long_request =
+      make_request_with_options("long",
+                                {1, 2, 3, 4, 5, 6, 7, 8},
+                                /*offline=*/false);
+  std::shared_ptr<Request> short_request =
+      make_request_with_options("short", {9, 10}, /*offline=*/false);
+  ASSERT_TRUE(scheduler.ContinuousScheduler::add_request(long_request));
+  ASSERT_TRUE(scheduler.ContinuousScheduler::add_request(short_request));
+
+  std::vector<Batch> batches = scheduler.prepare_batch_test();
+
+  ASSERT_EQ(batches.size(), 1u);
+  ASSERT_EQ(scheduler.get_running_requests().size(), 1u);
+  EXPECT_EQ(scheduler.get_running_requests()[0]->request_id(), "short");
+  double short_waiting = GAUGE_VALUE(num_short_request_first_short_waiting);
+  double long_waiting = GAUGE_VALUE(num_short_request_first_long_waiting);
+  EXPECT_EQ(short_waiting, 0);
+  EXPECT_EQ(long_waiting, 1);
+
+  block_manager->deallocate(scheduler.get_running_requests()[0].get());
+}
+
+TEST(DisaggPDChunkedPrefillSchedulerTest,
+     FeatureOnPrioritizesInFlightChunkedPrefillAsImmediate) {
+  ScopedConfigValue<bool> prefix_cache(
+      KVCacheConfig::get_instance().enable_prefix_cache(), true);
+  ScopedConfigValue<bool> enable_short_request_first(
+      SchedulerConfig::get_instance().enable_short_request_first(), true);
+  ScopedConfigValue<int32_t> short_request_first_threshold(
+      SchedulerConfig::get_instance().short_request_first_threshold(), 4);
+  ScopedConfigValue<double> short_request_first_long_max_wait_ms(
+      SchedulerConfig::get_instance().short_request_first_long_max_wait_ms(),
+      0.0);
+  FakeEngine engine(/*num_blocks=*/32, /*block_size=*/2);
+  BlockManagerPool* block_manager = engine.block_manager_pool();
+  DisaggPDChunkedPrefillScheduler scheduler(&engine,
+                                            make_options(
+                                                /*max_tokens_per_batch=*/2,
+                                                /*max_chunk=*/2));
+  std::shared_ptr<Request> running_request = make_request_with_options(
+      "running", {1, 2, 3, 4, 5, 6, 7, 8}, /*offline=*/false);
+  ASSERT_TRUE(scheduler.ContinuousScheduler::add_request(running_request));
+  std::vector<Batch> first_batches = scheduler.prepare_batch_test();
+  ASSERT_EQ(first_batches.size(), 1u);
+  ASSERT_EQ(scheduler.get_running_requests().size(), 1u);
+  ASSERT_EQ(scheduler.get_running_requests()[0]->request_id(), "running");
+
+  std::shared_ptr<Request> short_request =
+      make_request_with_options("short", {9, 10}, /*offline=*/false);
+  ASSERT_TRUE(scheduler.ContinuousScheduler::add_request(short_request));
+  std::vector<Batch> second_batches = scheduler.prepare_batch_test();
+
+  ASSERT_EQ(second_batches.size(), 1u);
+  ASSERT_EQ(scheduler.get_running_requests().size(), 1u);
+  EXPECT_EQ(scheduler.get_running_requests()[0]->request_id(), "running");
+  double immediate_waiting =
+      GAUGE_VALUE(num_short_request_first_immediate_waiting);
+  double short_waiting = GAUGE_VALUE(num_short_request_first_short_waiting);
+  EXPECT_EQ(immediate_waiting, 0);
+  EXPECT_EQ(short_waiting, 1);
+
+  block_manager->deallocate(scheduler.get_running_requests()[0].get());
+}
+
+TEST(DisaggPDChunkedPrefillSchedulerTest,
+     FeatureOnPromotesAgedLongBeforeShort) {
+  ScopedConfigValue<bool> prefix_cache(
+      KVCacheConfig::get_instance().enable_prefix_cache(), true);
+  ScopedConfigValue<bool> enable_short_request_first(
+      SchedulerConfig::get_instance().enable_short_request_first(), true);
+  ScopedConfigValue<int32_t> short_request_first_threshold(
+      SchedulerConfig::get_instance().short_request_first_threshold(), 4);
+  ScopedConfigValue<double> short_request_first_long_max_wait_ms(
+      SchedulerConfig::get_instance().short_request_first_long_max_wait_ms(),
+      50.0);
+  int64_t now_ms = 0;
+  FakeEngine engine(/*num_blocks=*/32, /*block_size=*/2);
+  BlockManagerPool* block_manager = engine.block_manager_pool();
+  DisaggPDChunkedPrefillScheduler scheduler(
+      &engine,
+      make_options(
+          /*max_tokens_per_batch=*/4,
+          /*max_chunk=*/4),
+      [&now_ms]() -> int64_t { return now_ms; });
+  std::shared_ptr<Request> long_request =
+      make_request_with_options("long",
+                                {1, 2, 3, 4, 5, 6, 7, 8},
+                                /*offline=*/false);
+  std::shared_ptr<Request> initial_short_request =
+      make_request_with_options("short-0", {9, 10}, /*offline=*/false);
+  ASSERT_TRUE(scheduler.ContinuousScheduler::add_request(long_request));
+  ASSERT_TRUE(
+      scheduler.ContinuousScheduler::add_request(initial_short_request));
+  std::vector<Batch> initial_batches = scheduler.prepare_batch_test();
+
+  ASSERT_EQ(initial_batches.size(), 1u);
+  ASSERT_EQ(scheduler.get_running_requests().size(), 1u);
+  ASSERT_EQ(scheduler.get_running_requests()[0]->request_id(), "short-0");
+  block_manager->deallocate(scheduler.get_running_requests()[0].get());
+  std::shared_ptr<Request> short_request =
+      make_request_with_options("short-1", {11, 12}, /*offline=*/false);
+  ASSERT_TRUE(scheduler.ContinuousScheduler::add_request(short_request));
+  now_ms = 80;
+  const double promotion_counter_before =
+      COUNTER_short_request_first_aged_long_promotions_total.get_value();
+  std::vector<Batch> aged_batches = scheduler.prepare_batch_test();
+
+  ASSERT_EQ(aged_batches.size(), 1u);
+  ASSERT_EQ(scheduler.get_running_requests().size(), 1u);
+  EXPECT_EQ(scheduler.get_running_requests()[0]->request_id(), "long");
+  EXPECT_GT(COUNTER_short_request_first_aged_long_promotions_total.get_value(),
+            promotion_counter_before);
+
+  block_manager->deallocate(scheduler.get_running_requests()[0].get());
+}
+
+TEST(DisaggPDChunkedPrefillSchedulerTest,
+     FeatureOnKeepsOfflineQueueInSecondSchedulingPass) {
+  ScopedConfigValue<bool> prefix_cache(
+      KVCacheConfig::get_instance().enable_prefix_cache(), true);
+  ScopedConfigValue<bool> enable_short_request_first(
+      SchedulerConfig::get_instance().enable_short_request_first(), true);
+  ScopedConfigValue<int32_t> short_request_first_threshold(
+      SchedulerConfig::get_instance().short_request_first_threshold(), 4);
+  ScopedConfigValue<double> short_request_first_long_max_wait_ms(
+      SchedulerConfig::get_instance().short_request_first_long_max_wait_ms(),
+      0.0);
+  FakeEngine engine(/*num_blocks=*/32, /*block_size=*/2);
+  BlockManagerPool* block_manager = engine.block_manager_pool();
+  DisaggPDChunkedPrefillScheduler scheduler(&engine,
+                                            make_options(
+                                                /*max_tokens_per_batch=*/4,
+                                                /*max_chunk=*/4));
+  std::shared_ptr<Request> online_request = make_request_with_options(
+      "online", {1, 2, 3, 4, 5, 6, 7, 8}, /*offline=*/false);
+  std::shared_ptr<Request> offline_request =
+      make_request_with_options("offline", {9, 10}, /*offline=*/true);
+  ASSERT_TRUE(scheduler.ContinuousScheduler::add_request(online_request));
+  ASSERT_TRUE(scheduler.ContinuousScheduler::add_request(offline_request));
+
+  std::vector<Batch> batches = scheduler.prepare_batch_test();
+
+  ASSERT_EQ(batches.size(), 1u);
+  ASSERT_EQ(scheduler.get_running_requests().size(), 1u);
+  EXPECT_EQ(scheduler.get_running_requests()[0]->request_id(), "online");
+  EXPECT_EQ(scheduler.get_waiting_requests_num(), 1u);
+
+  block_manager->deallocate(scheduler.get_running_requests()[0].get());
+}
+
+TEST(DisaggPDChunkedPrefillSchedulerTest,
+     ShortRequestFirstRejectsNonFcfsPriorityStrategy) {
+  EXPECT_DEATH(
+      {
+        SchedulerConfig::get_instance().enable_short_request_first(true);
+        FakeEngine engine(/*num_blocks=*/16, /*block_size=*/2);
+        auto options =
+            make_options(/*max_tokens_per_batch=*/4, /*max_chunk=*/4);
+        options.priority_strategy("priority");
+        DisaggPDChunkedPrefillScheduler scheduler(&engine, options);
+        UNUSED_PARAMETER(scheduler);
+      },
+      "priority_strategy=fcfs");
+}
+
+TEST(DisaggPDChunkedPrefillSchedulerTest,
+     ShortRequestFirstRejectsDecodeInstanceRole) {
+  EXPECT_DEATH(
+      {
+        SchedulerConfig::get_instance().enable_short_request_first(true);
+        FakeEngine engine(/*num_blocks=*/16, /*block_size=*/2);
+        auto options =
+            make_options(/*max_tokens_per_batch=*/4, /*max_chunk=*/4);
+        options.instance_role(InstanceRole::DECODE);
+        DisaggPDChunkedPrefillScheduler scheduler(&engine, options);
+        UNUSED_PARAMETER(scheduler);
+      },
+      "not decode instances");
+}
+
+TEST(DisaggPDChunkedPrefillSchedulerTest,
+     ShortRequestFirstRejectsDisabledChunkedPrefill) {
+  EXPECT_DEATH(
+      {
+        SchedulerConfig::get_instance().enable_short_request_first(true);
+        FakeEngine engine(/*num_blocks=*/16, /*block_size=*/2);
+        auto options =
+            make_options(/*max_tokens_per_batch=*/4, /*max_chunk=*/4);
+        options.enable_chunked_prefill(false);
+        DisaggPDChunkedPrefillScheduler scheduler(&engine, options);
+        UNUSED_PARAMETER(scheduler);
+      },
+      "enable_chunked_prefill=true");
+}
+
+TEST(DisaggPDChunkedPrefillSchedulerTest,
+     ShortRequestFirstRejectsDisabledDisaggPd) {
+  EXPECT_DEATH(
+      {
+        SchedulerConfig::get_instance().enable_short_request_first(true);
+        FakeEngine engine(/*num_blocks=*/16, /*block_size=*/2);
+        auto options =
+            make_options(/*max_tokens_per_batch=*/4, /*max_chunk=*/4);
+        options.enable_disagg_pd(false);
+        DisaggPDChunkedPrefillScheduler scheduler(&engine, options);
+        UNUSED_PARAMETER(scheduler);
+      },
+      "enable_disagg_pd=true");
 }
 
 }  // namespace xllm

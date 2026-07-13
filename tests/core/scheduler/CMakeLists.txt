@@ -9,6 +9,7 @@ cc_test(
     chunked_prefill_scheduler_test.cpp
     prefill_only_scheduler_test.cpp
     disagg_pd_chunked_prefill_scheduler_test.cpp
+    pd_prefill_short_request_first_queue_test.cpp
     disagg_pd_scheduler_test.cpp
     continuous_scheduler_test.cpp
     fixed_steps_scheduler_test.cpp
